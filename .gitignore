@@ -160,7 +160,7 @@ fabric.properties
 models/
 
 ### Ignore data sample image
-test3_cross_env/
+/test3_cross_env/
 
 ### Ignore tensorboard
 runs/
