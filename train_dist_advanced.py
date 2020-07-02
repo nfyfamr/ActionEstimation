@@ -1,0 +1,236 @@
+import argparse
+import torch
+import pickle
+import torch.nn as nn
+import numpy as np
+import os
+import glob
+import pdb
+
+
+from data_loader_mayavi import SeqVolumeDataset
+
+from model_advanced import ActionNet
+
+from torch.autograd import Variable 
+from torch.nn.utils.rnn import pack_padded_sequence
+import torch.utils.data
+import torch.utils.data.distributed
+from torchvision import transforms
+import logging
+#from colorlog import ColoredFormatter
+#import horovod.torch as hvd
+
+from loss import ContrastiveLoss
+def metric_average(val, name):
+    #tensor = torch.tensor(val)
+    #avg_tensor = hvd.allreduce(tensor, name=name, average = False)
+    #return avg_tensor.item()
+    return 0
+
+def main(args):
+
+    if not os.path.exists(args.model_path):
+        os.makedirs(args.model_path)
+
+    #hvd.init()
+    logging.basicConfig(level=logging.INFO,
+                                format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
+                                                    datefmt='%m-%d %H:%M',
+                                                    filename='{0}/training.log'.format(args.model_path),
+                                                    filemode='a')
+    # define a Handler which writes INFO messages or higher to the sys.stderr
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    formatter = logging.Formatter( "%(asctime)s %(name)-12s %(levelname)-8s %(message)s")
+    console.setFormatter(formatter)
+    logging.getLogger('').addHandler(console)
+    
+    data_loader_val = None
+    #data_set_training = SeqVolumeDataset(args.data_dir_val, args.list_fn_val, args.seq_len, w = 61, h = 61, d= 2100//25 + 1)
+    data_set_training = ''
+    full_dataset = SeqVolumeDataset(tar_fn=args.data_dir, list_fn=args.list_fn, seq_len=args.seq_len, w = 61, h = 61, d= 85)
+
+    #data_sampler = torch.utils.data.distributed.DistributedSampler(data_set_training, num_replicas=hvd.size(), rank=hvd.rank())
+    #data_loader = torch.utils.data.DataLoader(
+    #    data_set_training, batch_size=args.batch_size, shuffle=(data_sampler is None),
+    #    num_workers=args.num_workers, pin_memory=True, sampler=data_sampler)
+
+    test_size = int(0.1 * len(full_dataset))
+    train_size = len(full_dataset) - test_size*2
+    data_set_training, data_set_val, data_set_test = torch.utils.data.random_split(full_dataset, [train_size, test_size, test_size])
+
+    data_loader = torch.utils.data.DataLoader(data_set_training, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    data_loader_val = torch.utils.data.DataLoader(data_set_val, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+
+    #if args.list_fn_val:
+        #data_set_val = SeqVolumeDataset(tar_fn=args.data_dir_val, list_fn=args.list_fn_val, seq_len=args.seq_len, w = 61, h = 61, d= 85)
+        #data_sampler_val = torch.utils.data.distributed.DistributedSampler(data_set_val, num_replicas=hvd.size(), rank=hvd.rank())
+        #data_loader_val = torch.utils.data.DataLoader(data_set_val, batch_size = args.batch_size, shuffle = False, num_workers = args.num_workers, pin_memory = True, sampler = data_sampler_val)
+        #data_loader_val = torch.utils.data.DataLoader(data_set_val, batch_size=args.batch_size, shuffle=True,
+        #                                              num_workers=args.num_workers, pin_memory=True)
+
+    net = ActionNet(args.hidden_size, args.class_num)
+
+    print(net) 
+
+    #logging.info('HVD size %d, HVD rank %d', hvd.size(), hvd.rank())
+    if torch.cuda.is_available():
+        net.cuda()
+
+    #net = nn.DataParallel(net)
+    if args.model_fn:
+        logging.info('Loading from %s', args.model_fn)
+        net.load_state_dict( torch.load(args.model_fn) )
+
+    # Loss and Optimizer
+    criterion = nn.CrossEntropyLoss()
+    criterion_gc = ContrastiveLoss(0.5)
+    params = net.parameters()
+    optimizer = torch.optim.Adam(params, lr=args.learning_rate)
+    #optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=net.named_parameters())
+    #hvd.broadcast_parameters(net.state_dict(), root_rank=0)
+
+    # Train the Models
+    total_step = len(data_loader)
+    for epoch in range(args.num_epochs):
+        #data_sampler.set_epoch(epoch)
+        net.train()
+        for i, (data, lbls) in enumerate(data_loader):
+            # Set mini-batch dataset
+            data = Variable(data)
+            lbls = Variable(lbls)
+            if torch.cuda.is_available():
+                data = data.cuda()
+                lbls = lbls.cuda()
+            if data.size(0) !=  args.batch_size:
+                continue
+            net.zero_grad()
+            cur_batch_size = data.size(0)
+            outputs = net(data)
+
+            #lbls = lbls.expand(-1, outputs.size(1)).contiguous()
+            #outputs = outputs.view(outputs.size(0) * outputs.size(1), outputs.size(2))
+            #lbls = lbls.view(-1)
+            #loss_gc = criterion_gc(hs)
+            #loss = criterion(outputs, lbls)
+            loss = nn.MSELoss()(outputs, lbls.float())      # print(loss): tensor(0.2336, grad_fn=<MseLossBackward>)
+            #loss = loss_gc + loss_c
+            loss.backward()
+            #accuracy = (lbls.data == outputs.data.max(dim = 1)[1]).sum().item() * 1.0 / lbls.size(0)
+            if (outputs.round() + lbls).long().view(-1).bincount().size()[0] == 3:
+                accuracy = ((outputs>0.99).float() + lbls).long().view(-1).bincount().float()[2] / lbls.sum()
+            else:
+                accuracy = torch.zeros([1])
+            optimizer.step()
+
+            if i % args.log_step == 0:
+                #logging.info('Epoch [%d/%d], Step [%d/%d], Rank[%d], Loss_gc: %.4f, Loss_c: %.4f, Loss: %.4f, Accuracy: %.4f'
+                #      ,epoch, args.num_epochs, i, total_step, hvd.rank(), loss_gc.data.item(), loss_c.data.item(), loss.data.item(), accuracy)
+                logging.info(
+                    'Epoch [%d/%d], Step [%d/%d], Loss_gc: %.4f, Loss_c: %.4f, Loss: %.4f, Accuracy: %.4f'
+                    , epoch, args.num_epochs, i, total_step, loss.data.item(), loss.data.item(), loss.data.item(), accuracy.item())
+
+            if i % args.save_step == 0:
+                torch.save(net.state_dict(),
+                           os.path.join(args.model_path, 'action-net-%d-%d.pkl' % (epoch + 1, i)))
+
+            if i == 0:
+                os.system('nvidia-smi')
+
+        #if hvd.rank() == 0:
+        #    torch.save(net.state_dict(),
+        #        os.path.join(args.model_path,
+        #           'action-net-%d.pkl' %(epoch+1)))
+        #torch.save(net.state_dict(),
+        #           os.path.join(args.model_path, 'action-net-%d.pkl' % (epoch + 1)))
+
+        # Now testing.
+    #     if data_loader_val:
+    #         net.eval()
+    #         val_total = 0
+    #         val_correct = 0
+    #         with torch.no_grad():
+    #             for i, (data, lbls) in enumerate(data_loader_val):
+    #                 if True:
+    #                     data = Variable(data)
+    #                     lbls = Variable(lbls)
+    #                     if torch.cuda.is_available():
+    #                         data = data.cuda()
+    #                         lbls = lbls.cuda()
+    #
+    #                     cur_batch_size = data.size(0)
+    #                     if cur_batch_size != args.batch_size:
+    #                         continue
+    #                     outputs, hs = net(data)
+    #                     #lbls = lbls.unsqueeze(1)
+    #                     lbls = lbls.expand(-1, outputs.size(1)).contiguous()
+    #                     outputs = outputs.view(outputs.size(0) * outputs.size(1), outputs.size(2))
+    #                     lbls = lbls.view(-1)
+    #                     loss_c = criterion(outputs, lbls)
+    #                     loss_gc = criterion_gc(hs)
+    #                     loss = loss_c + loss_gc
+    #
+    #                     correct = (lbls.data == outputs.data.max(dim = 1)[1]).sum().item()
+    #                     accuracy = correct * 1.0 / lbls.size(0)
+    #                     val_correct += correct
+    #                     val_total += lbls.size(0)
+    #
+    #                     # Print log info
+    #                     if i % args.log_step == 0:
+    #                         #logging.info('Testing Epoch [%d/%d], Step [%d/%d], Rank[%d], Loss_gc: %.4f, Loss_c: %.4f, Loss: %.4f, Accuracy: %.4f'
+    #                         #      ,epoch, args.num_epochs, i, len(data_loader_val), hvd.rank(), loss_gc.item(), loss_c.item(), loss.item(), accuracy)
+    #                         logging.info(
+    #                             'Testing Epoch [%d/%d], Step [%d/%d], Loss_gc: %.4f, Loss_c: %.4f, Loss: %.4f, Accuracy: %.4f'
+    #                             , epoch, args.num_epochs, i, len(data_loader_val), loss_gc.item(),
+    #                             loss_c.item(), loss.item(), accuracy)
+    #
+    #
+    #         val_t = val_total
+    #         val_c = val_correct
+    #         #val_t = metric_average(val_total, 'sum_total')
+    #         #val_c = metric_average(val_correct, 'sum_correct')
+    #         logging.info('Testing Epoch [%d/%d], Val Accuracy: %.4f', epoch, args.num_epochs, val_c * 1.0 / val_t)
+    #         #if hvd.rank() == 0:
+    #         #    logging.info('Testing Epoch [%d/%d], Val Accuracy: %.4f', epoch, args.num_epochs, val_c * 1.0 / val_t)
+    #         #logging.info('Testing Epoch [%d/%d], Val Accuracy: %.4f', epoch, args.num_epochs, val_correct * 1.0 / val_total)
+    #
+    # #if hvd.rank() == 0:
+    # #    torch.save(net.state_dict(),
+    # #        os.path.join(args.model_path,
+    # #           'action-net-%d.pkl' %(epoch+1)))
+    # torch.save(net.state_dict(),
+    #            os.path.join(args.model_path,
+    #                         'action-net-%d.pkl' % (epoch + 1)))
+                
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_path', type=str, default='./models/' ,
+                        help='path for saving trained models')
+    parser.add_argument('--model_fn', type = str, default = '')    # 이 변수 값이 있으면 로드함
+    parser.add_argument('--data_dir', type=str, default = 'data/test3_cross_env/data_f9.tar')
+    parser.add_argument('--data_dir_val', type=str)
+    parser.add_argument('--list_fn', type=str, default = 'data/test3_cross_env/val_refined_001529.csv',
+                        help='list of the video clips')
+    parser.add_argument('--list_fn_val', type=str,
+                        help='list of the video clips')
+    parser.add_argument('--log_step', type=int , default=10,
+                        help='step size for prining log info')
+    parser.add_argument('--save_step', type=int , default=10,
+                        help='step size for saving trained models')
+    parser.add_argument('--num_layers', type=int , default=1 ,
+                        help='number of layers in lstm')
+    parser.add_argument('--class_num', type=int , default=10,
+                        help='number of class')
+    parser.add_argument('--hidden_size', type=int , default=512,
+                        help='number of class')
+    parser.add_argument('--num_epochs', type=int, default=100)
+    parser.add_argument('--seq_len', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=10)
+    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--learning_rate', type=float, default=0.0001)
+    args = parser.parse_args()
+    #print(args)
+
+    main(args)
+
